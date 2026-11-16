@@ -93,7 +93,10 @@ type client struct {
 	WindowSize         uint
 	RateLimiter        RateLimiter
 
-	inbox chan pdu.Body
+	// Guarded by inboxMtx; replaced on every Bind round.
+	inbox    chan pdu.Body
+	inboxMtx sync.RWMutex
+
 	conn  *connSwitch
 	stop  chan struct{}
 	once  sync.Once
@@ -119,6 +122,18 @@ func (c *client) init() {
 	}
 }
 
+func (c *client) setInbox(ch chan pdu.Body) {
+	c.inboxMtx.Lock()
+	c.inbox = ch
+	c.inboxMtx.Unlock()
+}
+
+func (c *client) getInbox() chan pdu.Body {
+	c.inboxMtx.RLock()
+	defer c.inboxMtx.RUnlock()
+	return c.inbox
+}
+
 // Bind starts the connection manager and blocks until Close is called.
 // It must be called in a goroutine.
 func (c *client) Bind() {
@@ -126,7 +141,8 @@ func (c *client) Bind() {
 	const maxdelay = 120.0
 	for !c.closed() {
 		eli := make(chan struct{})
-		c.inbox = make(chan pdu.Body)
+		inbox := make(chan pdu.Body)
+		c.setInbox(inbox)
 		conn, err := Dial(c.Addr, c.TLS)
 		if err != nil {
 			c.notify(&connStatus{
@@ -169,13 +185,13 @@ func (c *client) Bind() {
 				c.notify(&connStatus{s: Disconnected})
 				c.conn.Close()
 			default:
-				c.inbox <- p
+				inbox <- p
 			}
 		}
 	retry:
 		close(eli)
 		c.conn.Close()
-		close(c.inbox)
+		close(inbox)
 		delayDuration := c.BindInterval
 		if delayDuration == 0 {
 			delay = math.Min(delay*math.E, maxdelay)
@@ -230,7 +246,7 @@ func (c *client) notify(ev ConnStatus) {
 // Read reads PDU binary data off the wire and returns it.
 func (c *client) Read() (pdu.Body, error) {
 	select {
-	case pdu := <-c.inbox:
+	case pdu := <-c.getInbox():
 		return pdu, nil
 	case <-c.stop:
 		return nil, io.EOF
@@ -251,7 +267,7 @@ func (c *client) Close() error {
 		close(c.stop)
 		if err := c.conn.Write(pdu.NewUnbind()); err == nil {
 			select {
-			case <-c.inbox: // TODO: validate UnbindResp
+			case <-c.getInbox(): // TODO: validate UnbindResp
 			case <-time.After(time.Second):
 			}
 		}
